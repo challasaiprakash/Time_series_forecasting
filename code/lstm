@@ -11,7 +11,7 @@ from tensorflow.keras.layers import LSTM, Dense
 from tensorflow.keras.optimizers import Adam
 
 # --- Load and preprocess ---
-df = pd.read_csv("/content/solarharvesting.csv", parse_dates=['Date'])
+df = pd.read_csv("PATH TO DATASET", parse_dates=['Date'])
 df.set_index("Date", inplace=True)
 df = df.asfreq("D")
 df['Radiation'] = df['Radiation'].interpolate("time").bfill().ffill()
