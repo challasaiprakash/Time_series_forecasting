@@ -1,0 +1,167 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from statsmodels.tsa.seasonal import STL
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from arch import arch_model
+import pickle
+
+#  Custom MAPE function
+def mean_absolute_percentage_error(y_true, y_pred):
+    y_true, y_pred = np.array(y_true), np.array(y_pred)
+    return np.mean(np.abs((y_true - y_pred) / np.clip(y_true, 1e-8, None))) * 100
+
+#  Load and preprocess data
+df = pd.read_csv("PATH TO DATASET")
+df["Date"] = pd.to_datetime(df["Date"])
+df.set_index("Date", inplace=True)
+df = df.asfreq("D")
+df["Radiation"] = df["Radiation"].interpolate("time").bfill().ffill()
+
+#  STL decomposition 
+stl = STL(df["Radiation"], seasonal=365)
+res = stl.fit()
+df["trend"] = res.trend
+df["seasonal"] = res.seasonal
+df["residual"] = res.resid
+
+#  Use residuals for GARCH 
+residuals = df["residual"].dropna()
+
+#  Train-test split (90/10) 
+train_size = int(len(residuals) * 0.9)
+train, test = residuals[:train_size], residuals[train_size:]
+test_index = test.index
+
+#  Rescale training to avoid DataScaleWarning 
+train_scaled = 0.1 * train
+
+#  Fit GARCH(1,1) model 
+garch_model = arch_model(train_scaled, vol="Garch", p=1, q=1)
+garch_fit = garch_model.fit(disp="off")
+
+# Forecast 
+forecast_horizon = len(test)
+garch_forecast = garch_fit.forecast(horizon=forecast_horizon, reindex=False)
+predicted_mean = garch_forecast.mean.values[-1, :] / 0.1  # Rescale back
+pred_series = pd.Series(predicted_mean, index=test_index)
+
+#  Reconstruct predicted radiation
+reconstructed_pred = df.loc[test_index, "trend"] + df.loc[test_index, "seasonal"] + pred_series
+true_values = df.loc[test_index, "Radiation"]
+
+#  Save GARCH model 
+with open("trained_garch_model.pkl", "wb") as f:
+    pickle.dump(garch_fit, f)
+print(" GARCH model saved as 'trained_garch_model.pkl'")
+
+#  Combine results into DataFrame 
+results = pd.DataFrame({
+    "Actual": true_values.values,
+    "Predicted": reconstructed_pred.values
+}, index=test_index)
+
+#  Seasonal Masks 
+season_masks = {
+    "Winter": (results.index.month == 12) | (results.index.month <= 2),
+    "Spring": (results.index.month >= 3) & (results.index.month <= 5),
+    "Summer": (results.index.month >= 6) & (results.index.month <= 8),
+    "Autumn": (results.index.month >= 9) & (results.index.month <= 11),
+}
+
+#  Seasonal evaluation and plotting 
+for season, mask in season_masks.items():
+    subset = results[mask]
+    rmse_s = np.sqrt(mean_squared_error(subset["Actual"], subset["Predicted"]))
+    mae_s = mean_absolute_error(subset["Actual"], subset["Predicted"])
+    mape_s = mean_absolute_percentage_error(subset["Actual"], subset["Predicted"])
+
+    plt.figure(figsize=(8, 2.5), dpi=300)
+    plt.plot(subset.index, subset["Actual"], label="Actual Radiation", color="green", linewidth=3, linestyle='--')
+    plt.plot(subset.index, subset["Predicted"], label="Predicted Radiation", color="orange", linewidth=1, linestyle='-')
+    plt.xlabel("Date", fontsize=12)
+    plt.ylabel("Solar Radiation", fontsize=12)
+    plt.legend(fontsize=7, loc='upper right', ncol=2)
+    plt.tight_layout()
+    plt.savefig(f"garch_{season.lower()}_prediction.png", bbox_inches='tight')
+    plt.show()
+    plt.close()
+
+    print(f"\n {season}")
+    print(f"   RMSE : {rmse_s:.3f}")
+    print(f"   MAE  : {mae_s:.3f}")
+    print(f"   MAPE : {mape_s:.2f}%")
+
+#  Overall Test Set Plot 
+rmse = np.sqrt(mean_squared_error(results["Actual"], results["Predicted"]))
+mae = mean_absolute_error(results["Actual"], results["Predicted"])
+mape = mean_absolute_percentage_error(results["Actual"], results["Predicted"])
+
+plt.figure(figsize=(8, 2.5), dpi=300)
+plt.plot(results.index, results["Actual"], label="Actual Radiation", color="green", linewidth=3, linestyle='--')
+plt.plot(results.index, results["Predicted"], label="Predicted Radiation", color="orange", linewidth=1, linestyle='-')
+plt.xlabel("Date", fontsize=12)
+plt.ylabel("Solar Radiation", fontsize=12)
+plt.legend(fontsize=7, loc='upper right', ncol=2)
+plt.tight_layout()
+plt.savefig("garch_full_testset_prediction.png", bbox_inches='tight')
+plt.show()
+plt.close()
+
+print("\n Overall Test Set Metrics")
+print(f"   RMSE : {rmse:.3f}")
+print(f"   MAE  : {mae:.3f}")
+print(f"   MAPE : {mape:.2f}%")
+
+#  Year 2022 evaluation 
+mask_2022 = results.index.year == 2022
+subset_2022 = results[mask_2022]
+
+rmse_2022 = np.sqrt(mean_squared_error(subset_2022["Actual"], subset_2022["Predicted"]))
+mae_2022 = mean_absolute_error(subset_2022["Actual"], subset_2022["Predicted"])
+mape_2022 = mean_absolute_percentage_error(subset_2022["Actual"], subset_2022["Predicted"])
+
+plt.figure(figsize=(8, 2.5), dpi=300)
+plt.plot(subset_2022.index, subset_2022["Actual"], label="Actual Radiation", color="green", linewidth=3, linestyle='--')
+plt.plot(subset_2022.index, subset_2022["Predicted"], label="Predicted Radiation", color="orange", linewidth=1, linestyle='-')
+plt.xlabel("Date", fontsize=12)
+plt.ylabel("Solar Radiation", fontsize=12)
+plt.legend(fontsize=7, loc='upper right', ncol=2)
+plt.tight_layout()
+plt.savefig("garch_2022_prediction.png", bbox_inches='tight')
+plt.show()
+plt.close()
+
+print(f"\n Year 2022")
+print(f"   RMSE : {rmse_2022:.3f}")
+print(f"   MAE  : {mae_2022:.3f}")
+print(f"   MAPE : {mape_2022:.2f}%")
+
+#  December 2022 evaluation 
+mask_dec_2022 = (results.index >= "2022-12-01") & (results.index <= "2022-12-31")
+subset_dec = results[mask_dec_2022]
+
+rmse_dec = np.sqrt(mean_squared_error(subset_dec["Actual"], subset_dec["Predicted"]))
+mae_dec = mean_absolute_error(subset_dec["Actual"], subset_dec["Predicted"])
+mape_dec = mean_absolute_percentage_error(subset_dec["Actual"], subset_dec["Predicted"])
+
+plt.figure(figsize=(8, 2.5), dpi=300)
+plt.plot(subset_dec.index, subset_dec["Actual"], label="Actual Radiation", color="green", linewidth=3, linestyle='--')
+plt.scatter(subset_dec.index, subset_dec["Actual"], color="green", s=40)
+plt.plot(subset_dec.index, subset_dec["Predicted"], label="Predicted Radiation", color="orange", linewidth=1)
+plt.scatter(subset_dec.index, subset_dec["Predicted"], color="orange", s=10)
+plt.xlabel("Day of December 2022", fontsize=12)
+plt.ylabel("Solar Radiation", fontsize=12)
+plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%d'))
+plt.gca().xaxis.set_major_locator(mdates.DayLocator(interval=2))
+plt.legend(fontsize=7, loc='upper right', ncol=2)
+plt.tight_layout()
+plt.savefig("garch_december_2022_prediction.png", bbox_inches='tight')
+plt.show()
+plt.close()
+
+print(f"\n December 2022")
+print(f"   RMSE : {rmse_dec:.3f}")
+print(f"   MAE  : {mae_dec:.3f}")
+print(f"   MAPE : {mape_dec:.2f}%")
