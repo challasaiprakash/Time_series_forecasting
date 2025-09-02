@@ -1,1 +1,296 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from statsmodels.tsa.seasonal import STL
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
+from tensorflow.keras.optimizers import Adam
+
+# --- Load and preprocess ---
+df = pd.read_csv("/content/solarharvesting.csv", parse_dates=['Date'])
+df.set_index("Date", inplace=True)
+df = df.asfreq("D")
+df['Radiation'] = df['Radiation'].interpolate("time").bfill().ffill()
+
+# --- STL Decomposition ---
+stl = STL(df["Radiation"], seasonal=365)
+res = stl.fit()
+df["trend"] = res.trend
+df["seasonal"] = res.seasonal
+df["residual"] = res.resid
+
+# --- Feature engineering ---
+def create_features(data, target):
+    df_feat = data.copy()
+    df_feat["dayofyear"] = df_feat.index.dayofyear
+    df_feat["month"] = df_feat.index.month
+    df_feat["week_of_year"] = df_feat.index.isocalendar().week.astype(int)
+    df_feat["lag1"] = df_feat[target].shift(1)
+    df_feat["lag7"] = df_feat[target].shift(7)
+    df_feat["rolling7"] = df_feat[target].rolling(7).mean()
+    return df_feat.dropna()
+
+df_feat = create_features(df, "Radiation")
+
+# --- 90/10 Train-Test Split ---
+train_size = int(0.9 * len(df_feat))
+train = df_feat.iloc[:train_size]
+test = df_feat.iloc[train_size:]
+
+features = ["dayofyear", "month", "week_of_year", "lag1", "lag7", "rolling7", "trend", "seasonal", "residual"]
+target = "Radiation"
+
+# --- Prepare data for Hyperparameter Tuning ---
+train_tuning_size = int(0.8 * len(train))
+train_for_tuning = train.iloc[:train_tuning_size]
+val_for_tuning = train.iloc[train_tuning_size:]
+
+scaler_tuning = MinMaxScaler(feature_range=(0, 1))
+train_for_tuning_scaled = scaler_tuning.fit_transform(train_for_tuning[features + [target]])
+val_for_tuning_scaled = scaler_tuning.transform(val_for_tuning[features + [target]])
+
+X_train_tuned = train_for_tuning_scaled[:, :-1]
+y_train_tuned = train_for_tuning_scaled[:, -1]
+X_val = val_for_tuning_scaled[:, :-1]
+y_val = val_for_tuning_scaled[:, -1]
+
+X_train_tuned = X_train_tuned.reshape((X_train_tuned.shape[0], 1, X_train_tuned.shape[1]))
+X_val = X_val.reshape((X_val.shape[0], 1, X_val.shape[1]))
+
+# --- Hyperparameter Grid Search ---
+lstm_units_options = [50, 100, 150]
+learning_rates_options = [0.01, 0.001, 0.0001]
+epochs_options = [20, 50, 100]
+
+best_val_loss = float('inf')
+best_hyperparameters = {}
+best_model_for_tuning = None
+
+print("Starting Grid Search for LSTM Hyperparameters...")
+for units in lstm_units_options:
+    for lr in learning_rates_options:
+        for ep in epochs_options:
+            print(f"\nTesting: LSTM Units={units}, Learning Rate={lr}, Epochs={ep}")
+
+            model_candidate = Sequential()
+            model_candidate.add(LSTM(units, activation="relu", input_shape=(X_train_tuned.shape[1], X_train_tuned.shape[2])))
+            model_candidate.add(Dense(1))
+            model_candidate.compile(optimizer=Adam(learning_rate=lr), loss="mean_squared_error")
+
+            history_candidate = model_candidate.fit(
+                X_train_tuned, y_train_tuned,
+                epochs=ep,
+                batch_size=32,
+                verbose=0,
+                validation_data=(X_val, y_val)
+            )
+
+            current_val_loss = history_candidate.history['val_loss'][-1]
+            print(f"Validation MSE: {current_val_loss:.6f}")
+
+            if current_val_loss < best_val_loss:
+                best_val_loss = current_val_loss
+                best_hyperparameters = {
+                    'lstm_units': units,
+                    'learning_rate': lr,
+                    'epochs': ep
+                }
+                best_model_for_tuning = model_candidate
+
+print("\nGrid Search Complete.")
+print(f"Best Hyperparameters: {best_hyperparameters}")
+print(f"Best Validation MSE: {best_val_loss:.6f}")
+
+# --- Prepare data for final LSTM training ---
+scaler_final = MinMaxScaler(feature_range=(0, 1))
+train_scaled_final = scaler_final.fit_transform(train[features + [target]])
+test_scaled_final = scaler_final.transform(test[features + [target]])
+
+X_train_final = train_scaled_final[:, :-1]
+y_train_final = train_scaled_final[:, -1]
+X_test_final = test_scaled_final[:, :-1]
+y_test_final = test_scaled_final[:, -1]
+
+X_train_final = X_train_final.reshape((X_train_final.shape[0], 1, X_train_final.shape[1]))
+X_test_final = X_test_final.reshape((X_test_final.shape[0], 1, X_test_final.shape[1]))
+
+# --- Train final LSTM model ---
+print("\nTraining final LSTM model with best hyperparameters...")
+final_model = Sequential()
+final_model.add(LSTM(best_hyperparameters['lstm_units'], activation="relu",
+                     input_shape=(X_train_final.shape[1], X_train_final.shape[2])))
+final_model.add(Dense(1))
+final_model.compile(optimizer=Adam(learning_rate=best_hyperparameters['learning_rate']),
+                    loss="mean_squared_error")
+
+history_final = final_model.fit(
+    X_train_final, y_train_final,
+    epochs=best_hyperparameters['epochs'],
+    batch_size=32,
+    verbose=1
+)
+
+# --- Save trained model ---
+final_model.save("final_lstm_model.keras")
+final_model.save("final_lstm_model.h5")
+print("\n Trained LSTM model saved as 'final_lstm_model.keras' and 'final_lstm_model.h5'.")
+
+# --- Predict ---
+pred_scaled_final = final_model.predict(X_test_final)
+
+# --- Inverse scaling ---
+dummy_X_test_pred = np.zeros((X_test_final.shape[0], len(features) + 1))
+dummy_X_test_actual = np.zeros((X_test_final.shape[0], len(features) + 1))
+
+dummy_X_test_pred[:, -1] = pred_scaled_final.flatten()
+dummy_X_test_actual[:, -1] = y_test_final.flatten()
+
+pred = scaler_final.inverse_transform(dummy_X_test_pred)[:, -1]
+y_test_actual = scaler_final.inverse_transform(dummy_X_test_actual)[:, -1]
+
+# --- Metrics ---
+mae = mean_absolute_error(y_test_actual, pred)
+mape = np.mean(np.abs((y_test_actual - pred) / y_test_actual)) * 100
+rmse = np.sqrt(mean_squared_error(y_test_actual, pred))
+mse = mean_squared_error(y_test_actual, pred)
+
+print(f"\n--- Final LSTM Model Performance (Tuned) ---")
+print(f"Best Hyperparameters: {best_hyperparameters}")
+print(f" MAE  : {mae:.3f}")
+print(f" MAPE : {mape:.2f}%")
+print(f" RMSE : {rmse:.3f}")
+print(f" MSE  : {mse:.3f}")
+
+# --- Seasonal Evaluation ---
+season_masks = {
+    "Winter": ((test.index.month == 12) | (test.index.month <= 2)),
+    "Spring": ((test.index.month >= 3) & (test.index.month <= 5)),
+    "Summer": ((test.index.month >= 6) & (test.index.month <= 8)),
+    "Autumn": ((test.index.month >= 9) & (test.index.month <= 11)),
+}
+
+print("\n Seasonal Evaluation (LSTM Model):")
+for season, mask in season_masks.items():
+    true_season = pd.Series(y_test_actual, index=test.index)[mask]
+    pred_season = pd.Series(pred, index=test.index)[mask]
+
+    if not true_season.empty:
+        mae_season = mean_absolute_error(true_season, pred_season)
+        mape_season = np.mean(np.abs((true_season - pred_season) / true_season.replace(0, np.nan).dropna())) * 100
+        rmse_season = np.sqrt(mean_squared_error(true_season, pred_season))
+        mse_season = mean_squared_error(true_season, pred_season)
+
+        print(f"\n {season}")
+        print(f"   MAE  : {mae_season:.3f}")
+        print(f"   MAPE : {mape_season:.2f}%")
+        print(f"   RMSE : {rmse_season:.3f}")
+        print(f"   MSE  : {mse_season:.3f}")
+
+        plt.figure(figsize=(8, 2.5), dpi=500)
+        plt.plot(true_season.index, true_season, label="True Radiation", color="green", linewidth=3, linestyle='--')
+        plt.plot(pred_season.index, pred_season, label="Predicted Radiation", color="orange", linewidth=1, linestyle='-')
+        plt.xlabel("Date", fontsize=12)
+        plt.ylabel("Solar Radiation", fontsize=12)
+        plt.legend(fontsize=7, ncol=2, loc='upper right')
+        plt.tight_layout()
+        plt.savefig(f"lstm_season_{season.lower()}.png")
+        plt.show()
+        plt.close()
+    else:
+        print(f"\n {season}: No data available for this season in the test set.")
+
+# --- Save predictions ---
+result_df = pd.DataFrame({
+    "Date": test.index,
+    "Actual": y_test_actual,
+    "Predicted": pred
+})
+result_df.to_excel("lstm_predictions_tf_keras_tuned.xlsx", index=False)
+
+# --- STL Plot ---
+plt.figure(figsize=(8, 5), dpi=500)
+plt.subplot(4, 1, 1)
+plt.plot(df["Radiation"], label="Original Radiation", color="green", linewidth=1.5, linestyle='--')
+plt.legend(fontsize=7)
+plt.subplot(4, 1, 2)
+plt.plot(df["trend"], label="Trend", color="orange", linewidth=1.5)
+plt.legend(fontsize=7)
+plt.subplot(4, 1, 3)
+plt.plot(df["seasonal"], label="Seasonal", color="blue", linewidth=1.5)
+plt.legend(fontsize=7)
+plt.subplot(4, 1, 4)
+plt.plot(df["residual"], label="Residual", color="red", linewidth=1.5)
+plt.legend(fontsize=7)
+plt.tight_layout()
+plt.suptitle("STL Decomposition of Radiation Data", y=1.02, fontsize=12)
+plt.savefig("lstm_stl_tf_keras.png", dpi=500)
+plt.show()
+plt.close()
+
+# --- Train-Test Radiation Plot ---
+plt.figure(figsize=(8, 2.5), dpi=500)
+plt.plot(train.index, train["Radiation"], label="Training Radiation", color="green", linewidth=2, linestyle='--')
+plt.plot(test.index, y_test_actual, label="Testing Radiation", color="orange", linewidth=1, linestyle='-')
+if not test.empty:
+    plt.axvline(x=test.index[0], color="black", linestyle="--", linewidth=1, label="Train-Test Split")
+plt.legend(fontsize=7, ncol=2, loc='upper right')
+plt.xlabel("Date", fontsize=12)
+plt.ylabel("Solar Radiation", fontsize=12)
+plt.tight_layout()
+plt.savefig("train_test_radiation_split_tf_keras.png", dpi=500)
+plt.show()
+plt.close()
+
+# --- Training Loss Plot ---
+plt.figure(figsize=(8, 2.5), dpi=500)
+plt.plot(history_final.history["loss"], label="Training Loss", color="purple", linewidth=1.5)
+plt.xlabel("Epoch", fontsize=12)
+plt.ylabel("Loss (MSE)", fontsize=12)
+plt.legend(fontsize=7, ncol=2, loc='upper right')
+plt.tight_layout()
+plt.savefig("lstm_training_loss_tf_keras_tuned.png", dpi=500)
+plt.show()
+plt.close()
+
+# =======================
+# EXTRA PLOTS FROM CODE 2
+# =======================
+
+# --- Plot: December 2022 Only ---
+mask_dec_2022 = (test.index >= "2022-12-01") & (test.index <= "2022-12-31")
+true_dec_2022 = pd.Series(y_test_actual, index=test.index).loc[mask_dec_2022]
+pred_dec_2022 = pd.Series(pred, index=test.index).loc[mask_dec_2022]
+
+plt.figure(figsize=(8, 2.5), dpi=500)
+plt.plot(true_dec_2022.index, true_dec_2022, label="ACTUAL Radiation", color="green", linewidth=3, linestyle='--')
+plt.scatter(true_dec_2022.index, true_dec_2022, color="green", s=40)
+plt.plot(pred_dec_2022.index, pred_dec_2022, label="Predicted Radiation", color="orange", linewidth=1, linestyle='-')
+plt.scatter(pred_dec_2022.index, pred_dec_2022, color="orange", s=10)
+
+plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%d'))
+plt.gca().xaxis.set_major_locator(mdates.DayLocator(interval=2))
+
+plt.legend(fontsize=7, ncol=2, loc='upper right')
+plt.xlabel("Date", fontsize=12)
+plt.ylabel("Solar Radiation", fontsize=12)
+plt.tight_layout()
+plt.savefig("lstm_december_2022_tf_keras.png")
+plt.show()
+plt.close()
+
+# --- Overall Prediction Plot ---
+plt.figure(figsize=(8, 2.5), dpi=500)
+plt.plot(test.index, y_test_actual, label="Actual Radiation", color="green", linewidth=2, linestyle='--')
+plt.plot(test.index, pred, label="LSTM Prediction", color="orange", linewidth=1, linestyle='-')
+plt.legend(fontsize=7, ncol=2, loc='upper right')
+plt.xlabel("Date", fontsize=12)
+plt.ylabel("Solar Radiation", fontsize=12)
+plt.tight_layout()
+plt.savefig("lstm_prediction_tf_keras.png")
+plt.show()
+plt.close()
 
