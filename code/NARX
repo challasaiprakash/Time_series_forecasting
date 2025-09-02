@@ -1,1 +1,229 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from statsmodels.tsa.seasonal import STL
+from sklearn.neural_network import MLPRegressor
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from sklearn.preprocessing import MinMaxScaler
+import joblib
+import os
+
+# ---  MAPE ---
+def mean_absolute_percentage_error(y_true, y_pred):
+    y_true, y_pred = np.array(y_true), np.array(y_pred)
+    return np.mean(np.abs((y_true - y_pred) / np.clip(y_true, 1e-8, None))) * 100
+
+# --- Load data ---
+df = pd.read_csv("PATH TO DATASET", parse_dates=['Date'])
+df.set_index("Date", inplace=True)
+df = df.asfreq("D")
+df["Radiation"] = df["Radiation"].interpolate("time").bfill().ffill()
+
+# --- STL Decomposition ---
+stl = STL(df["Radiation"], seasonal=365)
+res = stl.fit()
+df["trend"] = res.trend
+df["seasonal"] = res.seasonal
+df["residual"] = res.resid
+
+# --- Feature engineering ---
+def create_features(data, target):
+    df_feat = data.copy()
+    df_feat["dayofyear"] = df_feat.index.dayofyear
+    df_feat["month"] = df_feat.index.month
+    df_feat["week_of_year"] = df_feat.index.isocalendar().week.astype(int)
+    df_feat["lag1"] = df_feat[target].shift(1)
+    df_feat["lag7"] = df_feat[target].shift(7)
+    df_feat["rolling7"] = df_feat[target].rolling(7).mean()
+    return df_feat.dropna()
+
+df_feat = create_features(df, "Radiation")
+
+# --- Train-test split (90/10) ---
+split_index = int(0.9 * len(df_feat))
+train_full = df_feat.iloc[:split_index]
+test = df_feat.iloc[split_index:]
+
+# --- Features and Target ---
+features = ["dayofyear", "month", "week_of_year", "lag1", "lag7", "rolling7", "trend", "seasonal", "residual"]
+target = "Radiation"
+
+# --- Prepare data for Hyperparameter Tuning ---
+train_tuning_size = int(0.8 * len(train_full))
+train_for_tuning = train_full.iloc[:train_tuning_size]
+val_for_tuning = train_full.iloc[train_tuning_size:]
+
+scaler = MinMaxScaler()
+X_train_tuning_scaled = scaler.fit_transform(train_for_tuning[features])
+y_train_tuning = train_for_tuning[target].values
+
+X_val_scaled = scaler.transform(val_for_tuning[features])
+y_val = val_for_tuning[target].values
+
+# --- Hyperparameter Grid Search ---
+hidden_layer_sizes_options = [(128, 64), (256, 128)]
+activation_options = ['relu', 'tanh']
+learning_rate_init_options = [0.001, 0.0005]
+max_iter_options = [500]
+
+best_val_rmse = float('inf')
+best_hyperparameters = {}
+best_model_for_tuning = None
+
+print("Starting Grid Search for NARX (MLPRegressor) Hyperparameters...")
+for hls in hidden_layer_sizes_options:
+    for activation in activation_options:
+        for lr in learning_rate_init_options:
+            for max_iter in max_iter_options:
+                print(f"\nTesting: Hidden Layers={hls}, Activation={activation}, LR={lr}, Max_Iter={max_iter}")
+                model_candidate = MLPRegressor(
+                    hidden_layer_sizes=hls,
+                    activation=activation,
+                    solver='adam',
+                    learning_rate_init=lr,
+                    max_iter=max_iter,
+                    random_state=42,
+                    early_stopping=True,
+                    validation_fraction=0.1,
+                    n_iter_no_change=10,
+                    verbose=False
+                )
+                try:
+                    model_candidate.fit(X_train_tuning_scaled, y_train_tuning)
+                    val_predictions = model_candidate.predict(X_val_scaled)
+                    current_val_rmse = np.sqrt(mean_squared_error(y_val, val_predictions))
+
+                    print(f"Validation RMSE: {current_val_rmse:.6f}")
+
+                    if current_val_rmse < best_val_rmse:
+                        best_val_rmse = current_val_rmse
+                        best_hyperparameters = {
+                            'hidden_layer_sizes': hls,
+                            'activation': activation,
+                            'learning_rate_init': lr,
+                            'max_iter': max_iter
+                        }
+                        best_model_for_tuning = model_candidate
+                except Exception as e:
+                    print(f"Error training with {hls}, {activation}, {lr}, {max_iter}: {e}")
+
+print("\nGrid Search Complete.")
+print(f"Best Hyperparameters: {best_hyperparameters}")
+print(f"Best Validation RMSE: {best_val_rmse:.6f}")
+
+# --- Train FINAL model ---
+print("\nTraining final NARX (MLPRegressor) model with best hyperparameters...")
+scaler_final = MinMaxScaler()
+X_train_final_scaled = scaler_final.fit_transform(train_full[features])
+y_train_final = train_full[target].values
+
+X_test_scaled = scaler_final.transform(test[features])
+y_test_actual = test[target].values
+
+final_model = MLPRegressor(
+    hidden_layer_sizes=best_hyperparameters['hidden_layer_sizes'],
+    activation=best_hyperparameters['activation'],
+    solver='adam',
+    learning_rate_init=best_hyperparameters['learning_rate_init'],
+    max_iter=best_hyperparameters['max_iter'],
+    random_state=42,
+    early_stopping=True,
+    validation_fraction=0.1,
+    n_iter_no_change=10,
+    verbose=True
+)
+final_model.fit(X_train_final_scaled, y_train_final)
+
+# --- Save the trained model and scaler ---
+os.makedirs("saved_model", exist_ok=True)
+joblib.dump(final_model, "saved_model/narx_mlp_model.pkl")
+joblib.dump(scaler_final, "saved_model/scaler.pkl")
+print("\nModel and scaler saved in 'saved_model/' folder.")
+
+# --- Predictions ---
+pred = final_model.predict(X_test_scaled)
+test["Predicted"] = pred
+
+# --- Metrics ---
+rmse = np.sqrt(mean_squared_error(y_test_actual, pred))
+mae = mean_absolute_error(y_test_actual, pred)
+mape = mean_absolute_percentage_error(y_test_actual, pred)
+
+print("\n--- Final NARX (MLPRegressor) Model Performance (Tuned) ---")
+print(f"MAE  : {mae:.3f}")
+print(f"MAPE : {mape:.2f}%")
+print(f"RMSE : {rmse:.3f}")
+
+# --- Full test plot ---
+plt.figure(figsize=(14, 6), dpi=300)
+plt.plot(test.index, y_test_actual, label="Actual Radiation", color="green", linewidth=2, linestyle='--')
+plt.plot(test.index, pred, label="MLP Prediction", color="orange", linewidth=1, linestyle='-')
+plt.title("PREDICTION (NARX MODEL FORECASTING)", fontweight='bold')
+plt.xlabel("Date", fontsize=16, fontweight='bold')
+plt.ylabel("Solar Radiation", fontsize=16, fontweight='bold')
+plt.legend()
+plt.tight_layout()
+plt.savefig("narx_full_prediction.png")
+plt.show()
+
+# --- December 2022 Prediction Plot ---
+december_mask = (test.index.month == 12) & (test.index.year == 2022)
+if december_mask.any():
+    plt.figure(figsize=(14, 6), dpi=300)
+    plt.plot(test.index[december_mask], y_test_actual[december_mask], label="Actual Radiation", color="green", linewidth=2, linestyle='--')
+    plt.plot(test.index[december_mask], pred[december_mask], label="MLP Prediction", color="orange", linewidth=1, linestyle='-')
+    plt.title("DECEMBER 2022 PREDICTION (NARX MODEL)", fontweight='bold')
+    plt.xlabel("Date", fontsize=16, fontweight='bold')
+    plt.ylabel("Solar Radiation", fontsize=16, fontweight='bold')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("narx_december_2022_prediction.png")
+    plt.show()
+else:
+    print("\nNo December 2022 data found in the test set.")
+
+# --- Seasonal Evaluation ---
+season_masks = {
+    "Winter": ((test.index.month == 12) | (test.index.month <= 2)),
+    "Spring": ((test.index.month >= 3) & (test.index.month <= 5)),
+    "Summer": ((test.index.month >= 6) & (test.index.month <= 8)),
+    "Autumn": ((test.index.month >= 9) & (test.index.month <= 11)),
+}
+
+seasonal_results = []
+print("\n📊 Seasonal Evaluation (NARX Model):")
+for season, mask in season_masks.items():
+    y_true_season = y_test_actual[mask]
+    y_pred_season = pred[mask]
+    subset_indices_season = test.index[mask]
+
+    if len(y_true_season) > 0:
+        rmse_s = np.sqrt(mean_squared_error(y_true_season, y_pred_season))
+        mae_s = mean_absolute_error(y_true_season, y_pred_season)
+        mape_s = mean_absolute_percentage_error(y_true_season, y_pred_season)
+
+        seasonal_results.append({
+            "Season": season,
+            "RMSE": rmse_s,
+            "MAE": mae_s,
+            "MAPE": mape_s
+        })
+
+        print(f"\n {season}")
+        print(f"   MAE  : {mae_s:.3f}")
+        print(f"   MAPE : {mape_s:.2f}%")
+        print(f"   RMSE : {rmse_s:.3f}")
+
+        plt.figure(figsize=(14, 5), dpi=300)
+        plt.plot(subset_indices_season, y_true_season, label="Actual Radiation", color="green", linewidth=3, linestyle='--')
+        plt.plot(subset_indices_season, y_pred_season, label="Predicted Radiation", color="orange", linewidth=1, linestyle='-')
+        plt.title(f"True vs Predicted Radiation - {season} (NARX MODEL)", fontweight='bold')
+        plt.xlabel("Date", fontsize=16, fontweight='bold')
+        plt.ylabel("Solar Radiation", fontsize=16, fontweight='bold')
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(f"narx_season_{season.lower()}.png")
+        plt.show()
+    else:
+        print(f"\n {season}: No data available for this season in the test set.")
 
